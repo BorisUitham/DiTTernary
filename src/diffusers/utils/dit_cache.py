@@ -59,6 +59,8 @@ class CacheConfig:
     alpha: float = 1.0
     cosine_threshold: float = 1.0
     warmup_steps: int = 0
+    kv_blend: float = 0.0
+    reset_on_shape_change: bool = True
 
     def __post_init__(self) -> None:
         if self.delta < 0:
@@ -67,6 +69,8 @@ class CacheConfig:
             raise ValueError("cache alpha must lie in [0, 1]")
         if self.warmup_steps < 0:
             raise ValueError("cache warmup_steps must be non-negative")
+        if not 0.0 <= self.kv_blend <= 1.0:
+            raise ValueError("cache kv_blend must lie in [0, 1]")
 
     @classmethod
     def from_flags(
@@ -78,6 +82,8 @@ class CacheConfig:
         alpha: Any = 1.0,
         cosine_threshold: Any = 1.0,
         warmup_steps: Any = 0,
+        kv_blend: Any = 0.0,
+        reset_on_shape_change: Any = True,
     ) -> "CacheConfig":
         """Create a :class:`CacheConfig` from flag-style inputs."""
 
@@ -119,6 +125,8 @@ class CacheConfig:
             alpha=_to_float(alpha),
             cosine_threshold=_to_float(cosine_threshold),
             warmup_steps=max(0, _to_int(warmup_steps, allow_none=True)),
+            kv_blend=_to_float(kv_blend),
+            reset_on_shape_change=_to_bool(reset_on_shape_change),
         )
 
     @property
@@ -225,12 +233,24 @@ class BlockCacheContext:
 
 
 @dataclass
+class AttentionCacheEntry:
+    """Container storing cached attention KV tensors for a head."""
+
+    iteration: int
+    spatial_shape: Tuple[int, ...]
+    key: Any
+    value: Any
+
+
+@dataclass
 class FeatureCache:
     """In-memory cache container for transformer features."""
 
     config: CacheConfig = field(default_factory=CacheConfig)
     store: MutableMapping[str, Deque[Tuple[int, Any]]] = field(default_factory=dict)
     metrics: CacheMetrics = field(default_factory=CacheMetrics)
+    attn_store: MutableMapping[str, Deque[AttentionCacheEntry]] = field(default_factory=dict)
+    attn_shapes: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
     _iteration: int = 0
     _current_iteration: Optional[int] = None
     _current_timestep: Optional[int] = None
@@ -239,6 +259,8 @@ class FeatureCache:
         """Drop all cached values and metrics."""
 
         self.store.clear()
+        self.attn_store.clear()
+        self.attn_shapes.clear()
         self.metrics = CacheMetrics()
         self._iteration = 0
         self._current_iteration = None
@@ -253,6 +275,9 @@ class FeatureCache:
     def _block_cache_active(self) -> bool:
         return self.config.active and self.config.level in {CacheLevel.BLOCK, CacheLevel.ATTN}
 
+    def _attn_cache_active(self) -> bool:
+        return self.config.active and self.config.level is CacheLevel.ATTN
+
     def _history_length(self) -> int:
         return max(1, int(self.config.delta) + 1)
 
@@ -261,6 +286,18 @@ class FeatureCache:
         if key not in self.store:
             self.store[key] = deque(maxlen=self._history_length())
         return self.store[key]
+
+    def _attn_prefix(self, layer_index: int) -> str:
+        return f"attn:{layer_index}:"
+
+    def _attn_key(self, layer_index: int, head_index: int) -> str:
+        return f"{self._attn_prefix(layer_index)}{head_index}"
+
+    def _get_attn_store(self, layer_index: int, head_index: int) -> Deque[AttentionCacheEntry]:
+        key = self._attn_key(layer_index, head_index)
+        if key not in self.attn_store:
+            self.attn_store[key] = deque(maxlen=self._history_length())
+        return self.attn_store[key]
 
     def _retrieve_cached(self, block_index: int, target_iteration: Optional[int]) -> Optional[Any]:
         if target_iteration is None or target_iteration <= 0:
@@ -273,6 +310,31 @@ class FeatureCache:
             if iteration == target_iteration:
                 return value
         return None
+
+    def _retrieve_attn_cached(
+        self,
+        layer_index: int,
+        head_index: int,
+        target_iteration: Optional[int],
+    ) -> Optional[AttentionCacheEntry]:
+        if target_iteration is None or target_iteration <= 0:
+            return None
+        key = self._attn_key(layer_index, head_index)
+        store = self.attn_store.get(key)
+        if not store:
+            return None
+        for entry in reversed(store):
+            if entry.iteration == target_iteration:
+                return entry
+        return None
+
+    def _clear_attn_layer(self, layer_index: int) -> None:
+        prefix = self._attn_prefix(layer_index)
+        keys = [key for key in self.attn_store if key.startswith(prefix)]
+        for key in keys:
+            del self.attn_store[key]
+        if layer_index in self.attn_shapes:
+            del self.attn_shapes[layer_index]
 
     def _blend_block_output(self, context: BlockCacheContext, hidden_states: Any) -> Any:
         if not self._block_cache_active():
@@ -324,6 +386,109 @@ class FeatureCache:
             return hidden_states
         blended = hidden_states.mul(alpha).add(candidate, alpha=1 - alpha)
         return blended
+
+    def _record_attention_batch(
+        self,
+        layer_index: int,
+        spatial_shape: Tuple[int, ...],
+        key: Any,
+        value: Any,
+    ) -> None:
+        if not self._attn_cache_active():
+            return
+        iteration = self._current_iteration
+        if iteration is None:
+            return
+        try:
+            import torch
+        except ModuleNotFoundError as exc:  # pragma: no cover - torch is required when caching is active
+            raise RuntimeError("FeatureCache requires torch to record attention states") from exc
+
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            return
+
+        heads = key.shape[1]
+        for head_index in range(heads):
+            head_key = key[:, head_index].detach().clone()
+            head_value = value[:, head_index].detach().clone()
+            entry = AttentionCacheEntry(
+                iteration=iteration,
+                spatial_shape=spatial_shape,
+                key=head_key,
+                value=head_value,
+            )
+            store = self._get_attn_store(layer_index, head_index)
+            store.append(entry)
+
+    def apply_attention(self, layer_index: int, key: Any, value: Any) -> Tuple[Any, Any]:
+        """Blend attention KV tensors with cached history if available."""
+
+        if not self._attn_cache_active():
+            return key, value
+        iteration = self._current_iteration
+        if iteration is None:
+            return key, value
+        try:
+            import torch
+        except ModuleNotFoundError as exc:  # pragma: no cover - torch is required when caching is active
+            raise RuntimeError("FeatureCache requires torch for attention caching") from exc
+
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            return key, value
+
+        blend = float(self.config.kv_blend)
+        spatial_shape = (int(key.shape[0]), int(key.shape[2]))
+
+        if self.config.reset_on_shape_change:
+            last_shape = self.attn_shapes.get(layer_index)
+            if last_shape is not None and last_shape != spatial_shape:
+                self._clear_attn_layer(layer_index)
+        self.attn_shapes[layer_index] = spatial_shape
+
+        target_iteration = iteration - int(self.config.delta)
+        use_cached = (
+            blend > 0.0
+            and iteration > self.config.warmup_steps
+            and target_iteration > 0
+        )
+
+        if not use_cached:
+            self._record_attention_batch(layer_index, spatial_shape, key, value)
+            return key, value
+
+        blended_key = key.clone()
+        blended_value = value.clone()
+        cached_used = False
+        for head_index in range(key.shape[1]):
+            entry = self._retrieve_attn_cached(layer_index, head_index, target_iteration)
+            if entry is None:
+                continue
+            if entry.spatial_shape != spatial_shape:
+                if self.config.reset_on_shape_change:
+                    self._clear_attn_layer(layer_index)
+                continue
+            cached_key = entry.key
+            cached_value = entry.value
+            if cached_key.device != key.device:
+                cached_key = cached_key.to(key.device)
+            if cached_key.dtype != key.dtype:
+                cached_key = cached_key.to(key.dtype)
+            if cached_value.device != value.device:
+                cached_value = cached_value.to(value.device)
+            if cached_value.dtype != value.dtype:
+                cached_value = cached_value.to(value.dtype)
+            current_key = key[:, head_index]
+            current_value = value[:, head_index]
+            blended_key[:, head_index] = current_key.mul(1.0 - blend).add(cached_key, alpha=blend)
+            blended_value[:, head_index] = current_value.mul(1.0 - blend).add(cached_value, alpha=blend)
+            cached_used = True
+
+        if not cached_used:
+            self._record_attention_batch(layer_index, spatial_shape, key, value)
+            return key, value
+
+        self._record_attention_batch(layer_index, spatial_shape, blended_key, blended_value)
+        return blended_key, blended_value
 
     def _record_cached_block(self, block_index: int, hidden_states: Any) -> None:
         if not self._block_cache_active():

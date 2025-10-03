@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Optional
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import PatchEmbed, Mlp
 
 
 def modulate(x, shift, scale):
@@ -104,6 +104,52 @@ class LabelEmbedder(nn.Module):
 #                                 Core DiT Model                                #
 #################################################################################
 
+class CachedAttention(nn.Module):
+    """Multi-head self-attention with optional cache-backed KV reuse."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.head_dim = head_dim
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, feature_cache=None, layer_index=None):
+        b, n, c = x.shape
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(b, n, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        if feature_cache is not None and layer_index is not None:
+            try:
+                k, v = feature_cache.apply_attention(layer_index, k, v)
+            except AttributeError:
+                pass
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -111,7 +157,7 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn = CachedAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -121,9 +167,15 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c, cache_context=None):
+    def forward(self, x, c, cache_context=None, block_index=None, feature_cache=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        attn_kwargs = {}
+        if feature_cache is not None and block_index is not None:
+            attn_kwargs = dict(feature_cache=feature_cache, layer_index=block_index)
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            **attn_kwargs,
+        )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         if cache_context is not None:
             x = cache_context.blend(x)
@@ -298,7 +350,13 @@ class DiT(nn.Module):
             cache_context = None
             if active_cache is not None:
                 x, cache_context = active_cache.on_block_input(block_idx, x)
-            x = block(x, c, cache_context=cache_context)  # (N, T, D)
+            x = block(
+                x,
+                c,
+                cache_context=cache_context,
+                block_index=block_idx,
+                feature_cache=active_cache,
+            )  # (N, T, D)
             if active_cache is not None:
                 x = active_cache.on_block_output(block_idx, x, cache_context=cache_context)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
