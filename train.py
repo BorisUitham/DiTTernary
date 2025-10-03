@@ -153,6 +153,7 @@ def main(args):
         warmup_steps=args.cache_warmup_steps,
         kv_blend=args.cache_kv_blend,
         reset_on_shape_change=args.cache_reset_on_shape_change,
+        cfg_share=args.cache_cfg_share,
     )
 
     # Setup DDP:
@@ -343,6 +344,13 @@ if __name__ == "__main__":
         dest="cache_reset_on_shape_change",
         type=str,
         default="true",
+    )
+    parser.add_argument(
+        "--cache.cfg-share",
+        dest="cache_cfg_share",
+        type=str,
+        choices=["off", "kv", "attn"],
+        default="off",
     )
     args = parser.parse_args()
     main(args)

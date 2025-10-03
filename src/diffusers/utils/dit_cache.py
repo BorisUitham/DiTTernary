@@ -18,6 +18,22 @@ from typing import Any, Deque, Dict, MutableMapping, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+class CFGShareMode(str, Enum):
+    """Sharing strategies for classifier-free guidance branches."""
+
+    OFF = "off"
+    KV = "kv"
+    ATTN = "attn"
+
+    @classmethod
+    def from_value(cls, value: Optional[str]) -> "CFGShareMode":
+        if value is None:
+            return cls.OFF
+        if isinstance(value, cls):
+            return value
+        return cls(str(value))
+
+
 class CacheLevel(str, Enum):
     """Granularity levels that a cache implementation can target."""
 
@@ -61,6 +77,7 @@ class CacheConfig:
     warmup_steps: int = 0
     kv_blend: float = 0.0
     reset_on_shape_change: bool = True
+    cfg_share: CFGShareMode = CFGShareMode.OFF
 
     def __post_init__(self) -> None:
         if self.delta < 0:
@@ -84,6 +101,7 @@ class CacheConfig:
         warmup_steps: Any = 0,
         kv_blend: Any = 0.0,
         reset_on_shape_change: Any = True,
+        cfg_share: Any = CFGShareMode.OFF,
     ) -> "CacheConfig":
         """Create a :class:`CacheConfig` from flag-style inputs."""
 
@@ -127,6 +145,7 @@ class CacheConfig:
             warmup_steps=max(0, _to_int(warmup_steps, allow_none=True)),
             kv_blend=_to_float(kv_blend),
             reset_on_shape_change=_to_bool(reset_on_shape_change),
+            cfg_share=CFGShareMode.from_value(cfg_share),
         )
 
     @property
@@ -232,6 +251,41 @@ class BlockCacheContext:
         return self.cache._blend_block_output(self, hidden_states)
 
 
+class CFGBranch(str, Enum):
+    """Identifier for the active CFG branch during shared execution."""
+
+    NONE = "none"
+    UNCOND = "uncond"
+    COND = "cond"
+
+
+@dataclass
+class CFGAttentionState:
+    """Runtime context describing shared attention tensors."""
+
+    branch: CFGBranch
+    mode: CFGShareMode
+    key: Optional[Any] = None
+    value: Optional[Any] = None
+    attn: Optional[Any] = None
+    context: Optional[Any] = None
+
+    def use_shared_kv(self) -> bool:
+        return (
+            self.branch is CFGBranch.COND
+            and self.mode in {CFGShareMode.KV, CFGShareMode.ATTN}
+            and self.key is not None
+            and self.value is not None
+        )
+
+    def use_shared_context(self) -> bool:
+        return (
+            self.branch is CFGBranch.COND
+            and self.mode is CFGShareMode.ATTN
+            and self.context is not None
+        )
+
+
 @dataclass
 class AttentionCacheEntry:
     """Container storing cached attention KV tensors for a head."""
@@ -254,6 +308,9 @@ class FeatureCache:
     _iteration: int = 0
     _current_iteration: Optional[int] = None
     _current_timestep: Optional[int] = None
+    _cfg_branch: CFGBranch = field(default=CFGBranch.NONE, init=False)
+    _cfg_kv_store: Dict[int, Tuple[Any, Any]] = field(default_factory=dict, init=False)
+    _cfg_attn_store: Dict[int, Tuple[Any, Any]] = field(default_factory=dict, init=False)
 
     def reset(self) -> None:
         """Drop all cached values and metrics."""
@@ -265,6 +322,9 @@ class FeatureCache:
         self._iteration = 0
         self._current_iteration = None
         self._current_timestep = None
+        self._cfg_branch = CFGBranch.NONE
+        self._cfg_kv_store.clear()
+        self._cfg_attn_store.clear()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -280,6 +340,33 @@ class FeatureCache:
 
     def _history_length(self) -> int:
         return max(1, int(self.config.delta) + 1)
+
+    def _cfg_share_active(self) -> bool:
+        return self.config.cfg_share is not CFGShareMode.OFF
+
+    def on_cfg_batch_start(self) -> None:
+        if not self._cfg_share_active():
+            return
+        self._cfg_branch = CFGBranch.UNCOND
+        self._cfg_kv_store.clear()
+        self._cfg_attn_store.clear()
+
+    def on_cfg_branch(self, branch: CFGBranch) -> None:
+        if not self._cfg_share_active():
+            return
+        if not isinstance(branch, CFGBranch):
+            branch = CFGBranch(str(branch))
+        self._cfg_branch = branch
+        if branch is CFGBranch.UNCOND:
+            self._cfg_kv_store.clear()
+            self._cfg_attn_store.clear()
+
+    def on_cfg_batch_end(self) -> None:
+        if not self._cfg_share_active():
+            return
+        self._cfg_branch = CFGBranch.NONE
+        self._cfg_kv_store.clear()
+        self._cfg_attn_store.clear()
 
     def _get_block_store(self, block_index: int) -> Deque[Tuple[int, Any]]:
         key = self._block_key(block_index)
@@ -490,6 +577,78 @@ class FeatureCache:
         self._record_attention_batch(layer_index, spatial_shape, blended_key, blended_value)
         return blended_key, blended_value
 
+    def prepare_cfg_attention(
+        self,
+        layer_index: int,
+        *,
+        device: Any,
+        dtype: Any,
+    ) -> Optional[CFGAttentionState]:
+        if not self._cfg_share_active():
+            return None
+        branch = self._cfg_branch
+        state = CFGAttentionState(branch=branch, mode=self.config.cfg_share)
+        if branch is CFGBranch.COND:
+            key_value = self._cfg_kv_store.get(layer_index)
+            if key_value is not None:
+                key, value = key_value
+                if hasattr(key, "to"):
+                    if key.device != device:
+                        key = key.to(device)
+                    if key.dtype != dtype:
+                        key = key.to(dtype)
+                if hasattr(value, "to"):
+                    if value.device != device:
+                        value = value.to(device)
+                    if value.dtype != dtype:
+                        value = value.to(dtype)
+                state.key = key
+                state.value = value
+            if self.config.cfg_share is CFGShareMode.ATTN:
+                attn_entry = self._cfg_attn_store.get(layer_index)
+                if attn_entry is not None:
+                    _, context = attn_entry
+                    if hasattr(context, "to"):
+                        if context.device != device or context.dtype != dtype:
+                            context = context.to(device=device, dtype=dtype)
+                    state.context = context
+        return state
+
+    def store_cfg_attention(
+        self,
+        layer_index: int,
+        key: Any,
+        value: Any,
+        *,
+        attn: Optional[Any] = None,
+        context: Optional[Any] = None,
+        head_context: Optional[Any] = None,
+    ) -> None:
+        if not self._cfg_share_active():
+            return
+        if self._cfg_branch is not CFGBranch.UNCOND:
+            return
+        if key is not None and value is not None:
+            try:
+                stored_key = key.detach().clone()
+                stored_value = value.detach().clone()
+            except AttributeError:
+                stored_key = key
+                stored_value = value
+            self._cfg_kv_store[layer_index] = (stored_key, stored_value)
+        if self.config.cfg_share is not CFGShareMode.ATTN:
+            return
+        target_context = context
+        if target_context is None and head_context is not None:
+            target_context = head_context
+        if target_context is None:
+            return
+        try:
+            stored_context = target_context.detach().clone()
+        except AttributeError:
+            stored_context = target_context
+        self._cfg_attn_store[layer_index] = (attn, stored_context)
+
     def _record_cached_block(self, block_index: int, hidden_states: Any) -> None:
         if not self._block_cache_active():
             return
@@ -505,6 +664,10 @@ class FeatureCache:
     # ------------------------------------------------------------------
     def on_step_start(self, timestep: Optional[int] = None) -> None:
         if not self._block_cache_active():
+            return
+        if self._cfg_share_active() and self._cfg_branch is CFGBranch.COND:
+            # Reuse the iteration established by the unconditional branch.
+            self._current_timestep = timestep
             return
         self._iteration += 1
         self._current_iteration = self._iteration

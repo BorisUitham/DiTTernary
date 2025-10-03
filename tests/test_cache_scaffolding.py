@@ -44,7 +44,13 @@ def _root_path() -> Path:
 def load_cache_components():
     module_path = _root_path() / "src" / "diffusers" / "utils" / "dit_cache.py"
     module = _load_module("diffusers.utils.dit_cache", module_path)
-    return module.CacheConfig, module.CacheLevel, module.CachePolicy, module.FeatureCache
+    return (
+        module,
+        module.CacheConfig,
+        module.CacheLevel,
+        module.CachePolicy,
+        module.FeatureCache,
+    )
 
 
 def load_pipeline():
@@ -52,7 +58,15 @@ def load_pipeline():
     return _load_module("diffusers.pipelines.dit.pipeline_dit", module_path)
 
 
-CacheConfig, CacheLevel, CachePolicy, FeatureCache = load_cache_components()
+(
+    CacheModule,
+    CacheConfig,
+    CacheLevel,
+    CachePolicy,
+    FeatureCache,
+) = load_cache_components()
+CFGShareMode = CacheModule.CFGShareMode
+CFGBranch = CacheModule.CFGBranch
 
 
 def make_model(cache_config=None):
@@ -117,6 +131,16 @@ def test_pipeline_threads_cache_config():
     assert result is transformer.kwargs
 
 
+def test_cache_config_cfg_share_flag():
+    cfg = CacheConfig.from_flags(
+        enable=True,
+        level=CacheLevel.ATTN,
+        policy=CachePolicy.DISABLED,
+        cfg_share="kv",
+    )
+    assert cfg.cfg_share is CFGShareMode.KV
+
+
 def _synchronize_models(cache_config):
     torch.manual_seed(0)
     base = make_model()
@@ -179,3 +203,45 @@ def test_block_cache_threshold_bypass_matches_baseline():
         out_cached = model_cached(x1, t1, y, cache_config=cfg, feature_cache=feature_cache)
     assert torch.allclose(out_plain, out_cached)
     assert feature_cache.metrics.cache_hits == 0
+
+
+def test_feature_cache_cfg_kv_roundtrip():
+    cfg = CacheConfig(
+        enable=True,
+        level=CacheLevel.ATTN,
+        policy=CachePolicy.DISABLED,
+        cfg_share=CFGShareMode.KV,
+    )
+    cache = FeatureCache(cfg)
+    cache.on_cfg_batch_start()
+    cache.on_cfg_branch(CFGBranch.UNCOND)
+    key = torch.randn(1, 2, 3, 4)
+    value = torch.randn_like(key)
+    _ = cache.prepare_cfg_attention(0, device=key.device, dtype=key.dtype)
+    cache.store_cfg_attention(0, key, value)
+    cache.on_cfg_branch(CFGBranch.COND)
+    state = cache.prepare_cfg_attention(0, device=key.device, dtype=key.dtype)
+    assert state is not None
+    assert state.use_shared_kv()
+
+
+def test_feature_cache_cfg_attn_context_reuse():
+    cfg = CacheConfig(
+        enable=True,
+        level=CacheLevel.ATTN,
+        policy=CachePolicy.DISABLED,
+        cfg_share=CFGShareMode.ATTN,
+    )
+    cache = FeatureCache(cfg)
+    cache.on_cfg_batch_start()
+    cache.on_cfg_branch(CFGBranch.UNCOND)
+    key = torch.randn(1, 2, 3, 4)
+    value = torch.randn_like(key)
+    context = torch.randn(1, 6, 8)
+    _ = cache.prepare_cfg_attention(1, device=key.device, dtype=key.dtype)
+    cache.store_cfg_attention(1, key, value, context=context)
+    cache.on_cfg_branch(CFGBranch.COND)
+    state = cache.prepare_cfg_attention(1, device=key.device, dtype=key.dtype)
+    assert state is not None
+    assert state.use_shared_context()
+    assert torch.allclose(state.context, context)
