@@ -147,6 +147,10 @@ def main(args):
         enable=args.cache_enable,
         level=args.cache_level,
         policy=args.cache_policy,
+        delta=args.cache_delta,
+        alpha=args.cache_alpha,
+        cosine_threshold=args.cache_cosine_threshold,
+        warmup_steps=args.cache_warmup_steps,
     )
 
     # Setup DDP:
@@ -316,6 +320,20 @@ if __name__ == "__main__":
         type=str,
         choices=["disabled"],
         default="disabled",
+    )
+    parser.add_argument("--cache.delta", dest="cache_delta", type=int, default=1)
+    parser.add_argument("--cache.alpha", dest="cache_alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--cache.cosine-threshold",
+        dest="cache_cosine_threshold",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--cache.warmup-steps",
+        dest="cache_warmup_steps",
+        type=int,
+        default=0,
     )
     args = parser.parse_args()
     main(args)

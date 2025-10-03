@@ -121,10 +121,12 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, cache_context=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        if cache_context is not None:
+            x = cache_context.blend(x)
         return x
 
 
@@ -285,12 +287,20 @@ class DiT(nn.Module):
         resolved_config = cache_config or self.cache_config
         if active_cache is None and resolved_config is not None and resolved_config.active:
             active_cache = FeatureCache(resolved_config)
+        if active_cache is not None:
+            step_value = None
+            try:
+                step_value = int(t.reshape(-1)[0].item())
+            except Exception:  # pragma: no cover - best-effort extraction
+                step_value = None
+            active_cache.on_step_start(step_value)
         for block_idx, block in enumerate(self.blocks):
+            cache_context = None
             if active_cache is not None:
-                x = active_cache.on_block_input(block_idx, x)
-            x = block(x, c)                      # (N, T, D)
+                x, cache_context = active_cache.on_block_input(block_idx, x)
+            x = block(x, c, cache_context=cache_context)  # (N, T, D)
             if active_cache is not None:
-                x = active_cache.on_block_output(block_idx, x)
+                x = active_cache.on_block_output(block_idx, x, cache_context=cache_context)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
