@@ -7,7 +7,11 @@ from types import ModuleType
 import pytest
 
 torch = pytest.importorskip("torch")
-
+# Ensure the project root (which contains `models.py`) is importable when the
+# test file is executed directly, e.g. ``python tests/test_cache_scaffolding.py``.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 from models import DiT
 
 
@@ -32,7 +36,7 @@ def _load_module(name: str, relative_path: Path):
 
 
 def _root_path() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return PROJECT_ROOT
 
 
 def load_cache_components():
