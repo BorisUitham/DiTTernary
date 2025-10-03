@@ -1,0 +1,4 @@
+sample.png
+__pycache__/
+diffusion/__pycache__/
+pretrained_models/
