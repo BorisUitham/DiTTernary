@@ -62,6 +62,9 @@ def main(args):
         alpha=args.cache_alpha,
         cosine_threshold=args.cache_cosine_threshold,
         warmup_steps=args.cache_warmup_steps,
+        kv_blend=args.cache_kv_blend,
+        reset_on_shape_change=args.cache_reset_on_shape_change,
+        cfg_share=args.cache_cfg_share,
     )
 
     if args.ckpt is None:
@@ -137,6 +140,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cache.delta", dest="cache_delta", type=int, default=1)
     parser.add_argument("--cache.alpha", dest="cache_alpha", type=float, default=1.0)
+    parser.add_argument("--cache.kv-blend", dest="cache_kv_blend", type=float, default=0.0)
     parser.add_argument(
         "--cache.cosine-threshold",
         dest="cache_cosine_threshold",
@@ -148,6 +152,19 @@ if __name__ == "__main__":
         dest="cache_warmup_steps",
         type=int,
         default=0,
+    )
+    parser.add_argument(
+        "--cache.reset-on-shape-change",
+        dest="cache_reset_on_shape_change",
+        type=str,
+        default="true",
+    )
+    parser.add_argument(
+        "--cache.cfg-share",
+        dest="cache_cfg_share",
+        type=str,
+        choices=["off", "kv", "attn"],
+        default="off",
     )
     args = parser.parse_args()
     main(args)

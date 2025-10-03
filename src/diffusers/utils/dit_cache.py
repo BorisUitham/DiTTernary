@@ -18,6 +18,22 @@ from typing import Any, Deque, Dict, MutableMapping, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+class CFGShareMode(str, Enum):
+    """Sharing strategies for classifier-free guidance branches."""
+
+    OFF = "off"
+    KV = "kv"
+    ATTN = "attn"
+
+    @classmethod
+    def from_value(cls, value: Optional[str]) -> "CFGShareMode":
+        if value is None:
+            return cls.OFF
+        if isinstance(value, cls):
+            return value
+        return cls(str(value))
+
+
 class CacheLevel(str, Enum):
     """Granularity levels that a cache implementation can target."""
 
@@ -59,6 +75,9 @@ class CacheConfig:
     alpha: float = 1.0
     cosine_threshold: float = 1.0
     warmup_steps: int = 0
+    kv_blend: float = 0.0
+    reset_on_shape_change: bool = True
+    cfg_share: CFGShareMode = CFGShareMode.OFF
 
     def __post_init__(self) -> None:
         if self.delta < 0:
@@ -67,6 +86,8 @@ class CacheConfig:
             raise ValueError("cache alpha must lie in [0, 1]")
         if self.warmup_steps < 0:
             raise ValueError("cache warmup_steps must be non-negative")
+        if not 0.0 <= self.kv_blend <= 1.0:
+            raise ValueError("cache kv_blend must lie in [0, 1]")
 
     @classmethod
     def from_flags(
@@ -78,6 +99,9 @@ class CacheConfig:
         alpha: Any = 1.0,
         cosine_threshold: Any = 1.0,
         warmup_steps: Any = 0,
+        kv_blend: Any = 0.0,
+        reset_on_shape_change: Any = True,
+        cfg_share: Any = CFGShareMode.OFF,
     ) -> "CacheConfig":
         """Create a :class:`CacheConfig` from flag-style inputs."""
 
@@ -119,6 +143,9 @@ class CacheConfig:
             alpha=_to_float(alpha),
             cosine_threshold=_to_float(cosine_threshold),
             warmup_steps=max(0, _to_int(warmup_steps, allow_none=True)),
+            kv_blend=_to_float(kv_blend),
+            reset_on_shape_change=_to_bool(reset_on_shape_change),
+            cfg_share=CFGShareMode.from_value(cfg_share),
         )
 
     @property
@@ -224,6 +251,51 @@ class BlockCacheContext:
         return self.cache._blend_block_output(self, hidden_states)
 
 
+class CFGBranch(str, Enum):
+    """Identifier for the active CFG branch during shared execution."""
+
+    NONE = "none"
+    UNCOND = "uncond"
+    COND = "cond"
+
+
+@dataclass
+class CFGAttentionState:
+    """Runtime context describing shared attention tensors."""
+
+    branch: CFGBranch
+    mode: CFGShareMode
+    key: Optional[Any] = None
+    value: Optional[Any] = None
+    attn: Optional[Any] = None
+    context: Optional[Any] = None
+
+    def use_shared_kv(self) -> bool:
+        return (
+            self.branch is CFGBranch.COND
+            and self.mode in {CFGShareMode.KV, CFGShareMode.ATTN}
+            and self.key is not None
+            and self.value is not None
+        )
+
+    def use_shared_context(self) -> bool:
+        return (
+            self.branch is CFGBranch.COND
+            and self.mode is CFGShareMode.ATTN
+            and self.context is not None
+        )
+
+
+@dataclass
+class AttentionCacheEntry:
+    """Container storing cached attention KV tensors for a head."""
+
+    iteration: int
+    spatial_shape: Tuple[int, ...]
+    key: Any
+    value: Any
+
+
 @dataclass
 class FeatureCache:
     """In-memory cache container for transformer features."""
@@ -231,18 +303,28 @@ class FeatureCache:
     config: CacheConfig = field(default_factory=CacheConfig)
     store: MutableMapping[str, Deque[Tuple[int, Any]]] = field(default_factory=dict)
     metrics: CacheMetrics = field(default_factory=CacheMetrics)
+    attn_store: MutableMapping[str, Deque[AttentionCacheEntry]] = field(default_factory=dict)
+    attn_shapes: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
     _iteration: int = 0
     _current_iteration: Optional[int] = None
     _current_timestep: Optional[int] = None
+    _cfg_branch: CFGBranch = field(default=CFGBranch.NONE, init=False)
+    _cfg_kv_store: Dict[int, Tuple[Any, Any]] = field(default_factory=dict, init=False)
+    _cfg_attn_store: Dict[int, Tuple[Any, Any]] = field(default_factory=dict, init=False)
 
     def reset(self) -> None:
         """Drop all cached values and metrics."""
 
         self.store.clear()
+        self.attn_store.clear()
+        self.attn_shapes.clear()
         self.metrics = CacheMetrics()
         self._iteration = 0
         self._current_iteration = None
         self._current_timestep = None
+        self._cfg_branch = CFGBranch.NONE
+        self._cfg_kv_store.clear()
+        self._cfg_attn_store.clear()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -253,14 +335,56 @@ class FeatureCache:
     def _block_cache_active(self) -> bool:
         return self.config.active and self.config.level in {CacheLevel.BLOCK, CacheLevel.ATTN}
 
+    def _attn_cache_active(self) -> bool:
+        return self.config.active and self.config.level is CacheLevel.ATTN
+
     def _history_length(self) -> int:
         return max(1, int(self.config.delta) + 1)
+
+    def _cfg_share_active(self) -> bool:
+        return self.config.cfg_share is not CFGShareMode.OFF
+
+    def on_cfg_batch_start(self) -> None:
+        if not self._cfg_share_active():
+            return
+        self._cfg_branch = CFGBranch.UNCOND
+        self._cfg_kv_store.clear()
+        self._cfg_attn_store.clear()
+
+    def on_cfg_branch(self, branch: CFGBranch) -> None:
+        if not self._cfg_share_active():
+            return
+        if not isinstance(branch, CFGBranch):
+            branch = CFGBranch(str(branch))
+        self._cfg_branch = branch
+        if branch is CFGBranch.UNCOND:
+            self._cfg_kv_store.clear()
+            self._cfg_attn_store.clear()
+
+    def on_cfg_batch_end(self) -> None:
+        if not self._cfg_share_active():
+            return
+        self._cfg_branch = CFGBranch.NONE
+        self._cfg_kv_store.clear()
+        self._cfg_attn_store.clear()
 
     def _get_block_store(self, block_index: int) -> Deque[Tuple[int, Any]]:
         key = self._block_key(block_index)
         if key not in self.store:
             self.store[key] = deque(maxlen=self._history_length())
         return self.store[key]
+
+    def _attn_prefix(self, layer_index: int) -> str:
+        return f"attn:{layer_index}:"
+
+    def _attn_key(self, layer_index: int, head_index: int) -> str:
+        return f"{self._attn_prefix(layer_index)}{head_index}"
+
+    def _get_attn_store(self, layer_index: int, head_index: int) -> Deque[AttentionCacheEntry]:
+        key = self._attn_key(layer_index, head_index)
+        if key not in self.attn_store:
+            self.attn_store[key] = deque(maxlen=self._history_length())
+        return self.attn_store[key]
 
     def _retrieve_cached(self, block_index: int, target_iteration: Optional[int]) -> Optional[Any]:
         if target_iteration is None or target_iteration <= 0:
@@ -273,6 +397,31 @@ class FeatureCache:
             if iteration == target_iteration:
                 return value
         return None
+
+    def _retrieve_attn_cached(
+        self,
+        layer_index: int,
+        head_index: int,
+        target_iteration: Optional[int],
+    ) -> Optional[AttentionCacheEntry]:
+        if target_iteration is None or target_iteration <= 0:
+            return None
+        key = self._attn_key(layer_index, head_index)
+        store = self.attn_store.get(key)
+        if not store:
+            return None
+        for entry in reversed(store):
+            if entry.iteration == target_iteration:
+                return entry
+        return None
+
+    def _clear_attn_layer(self, layer_index: int) -> None:
+        prefix = self._attn_prefix(layer_index)
+        keys = [key for key in self.attn_store if key.startswith(prefix)]
+        for key in keys:
+            del self.attn_store[key]
+        if layer_index in self.attn_shapes:
+            del self.attn_shapes[layer_index]
 
     def _blend_block_output(self, context: BlockCacheContext, hidden_states: Any) -> Any:
         if not self._block_cache_active():
@@ -325,6 +474,181 @@ class FeatureCache:
         blended = hidden_states.mul(alpha).add(candidate, alpha=1 - alpha)
         return blended
 
+    def _record_attention_batch(
+        self,
+        layer_index: int,
+        spatial_shape: Tuple[int, ...],
+        key: Any,
+        value: Any,
+    ) -> None:
+        if not self._attn_cache_active():
+            return
+        iteration = self._current_iteration
+        if iteration is None:
+            return
+        try:
+            import torch
+        except ModuleNotFoundError as exc:  # pragma: no cover - torch is required when caching is active
+            raise RuntimeError("FeatureCache requires torch to record attention states") from exc
+
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            return
+
+        heads = key.shape[1]
+        for head_index in range(heads):
+            head_key = key[:, head_index].detach().clone()
+            head_value = value[:, head_index].detach().clone()
+            entry = AttentionCacheEntry(
+                iteration=iteration,
+                spatial_shape=spatial_shape,
+                key=head_key,
+                value=head_value,
+            )
+            store = self._get_attn_store(layer_index, head_index)
+            store.append(entry)
+
+    def apply_attention(self, layer_index: int, key: Any, value: Any) -> Tuple[Any, Any]:
+        """Blend attention KV tensors with cached history if available."""
+
+        if not self._attn_cache_active():
+            return key, value
+        iteration = self._current_iteration
+        if iteration is None:
+            return key, value
+        try:
+            import torch
+        except ModuleNotFoundError as exc:  # pragma: no cover - torch is required when caching is active
+            raise RuntimeError("FeatureCache requires torch for attention caching") from exc
+
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            return key, value
+
+        blend = float(self.config.kv_blend)
+        spatial_shape = (int(key.shape[0]), int(key.shape[2]))
+
+        if self.config.reset_on_shape_change:
+            last_shape = self.attn_shapes.get(layer_index)
+            if last_shape is not None and last_shape != spatial_shape:
+                self._clear_attn_layer(layer_index)
+        self.attn_shapes[layer_index] = spatial_shape
+
+        target_iteration = iteration - int(self.config.delta)
+        use_cached = (
+            blend > 0.0
+            and iteration > self.config.warmup_steps
+            and target_iteration > 0
+        )
+
+        if not use_cached:
+            self._record_attention_batch(layer_index, spatial_shape, key, value)
+            return key, value
+
+        blended_key = key.clone()
+        blended_value = value.clone()
+        cached_used = False
+        for head_index in range(key.shape[1]):
+            entry = self._retrieve_attn_cached(layer_index, head_index, target_iteration)
+            if entry is None:
+                continue
+            if entry.spatial_shape != spatial_shape:
+                if self.config.reset_on_shape_change:
+                    self._clear_attn_layer(layer_index)
+                continue
+            cached_key = entry.key
+            cached_value = entry.value
+            if cached_key.device != key.device:
+                cached_key = cached_key.to(key.device)
+            if cached_key.dtype != key.dtype:
+                cached_key = cached_key.to(key.dtype)
+            if cached_value.device != value.device:
+                cached_value = cached_value.to(value.device)
+            if cached_value.dtype != value.dtype:
+                cached_value = cached_value.to(value.dtype)
+            current_key = key[:, head_index]
+            current_value = value[:, head_index]
+            blended_key[:, head_index] = current_key.mul(1.0 - blend).add(cached_key, alpha=blend)
+            blended_value[:, head_index] = current_value.mul(1.0 - blend).add(cached_value, alpha=blend)
+            cached_used = True
+
+        if not cached_used:
+            self._record_attention_batch(layer_index, spatial_shape, key, value)
+            return key, value
+
+        self._record_attention_batch(layer_index, spatial_shape, blended_key, blended_value)
+        return blended_key, blended_value
+
+    def prepare_cfg_attention(
+        self,
+        layer_index: int,
+        *,
+        device: Any,
+        dtype: Any,
+    ) -> Optional[CFGAttentionState]:
+        if not self._cfg_share_active():
+            return None
+        branch = self._cfg_branch
+        state = CFGAttentionState(branch=branch, mode=self.config.cfg_share)
+        if branch is CFGBranch.COND:
+            key_value = self._cfg_kv_store.get(layer_index)
+            if key_value is not None:
+                key, value = key_value
+                if hasattr(key, "to"):
+                    if key.device != device:
+                        key = key.to(device)
+                    if key.dtype != dtype:
+                        key = key.to(dtype)
+                if hasattr(value, "to"):
+                    if value.device != device:
+                        value = value.to(device)
+                    if value.dtype != dtype:
+                        value = value.to(dtype)
+                state.key = key
+                state.value = value
+            if self.config.cfg_share is CFGShareMode.ATTN:
+                attn_entry = self._cfg_attn_store.get(layer_index)
+                if attn_entry is not None:
+                    _, context = attn_entry
+                    if hasattr(context, "to"):
+                        if context.device != device or context.dtype != dtype:
+                            context = context.to(device=device, dtype=dtype)
+                    state.context = context
+        return state
+
+    def store_cfg_attention(
+        self,
+        layer_index: int,
+        key: Any,
+        value: Any,
+        *,
+        attn: Optional[Any] = None,
+        context: Optional[Any] = None,
+        head_context: Optional[Any] = None,
+    ) -> None:
+        if not self._cfg_share_active():
+            return
+        if self._cfg_branch is not CFGBranch.UNCOND:
+            return
+        if key is not None and value is not None:
+            try:
+                stored_key = key.detach().clone()
+                stored_value = value.detach().clone()
+            except AttributeError:
+                stored_key = key
+                stored_value = value
+            self._cfg_kv_store[layer_index] = (stored_key, stored_value)
+        if self.config.cfg_share is not CFGShareMode.ATTN:
+            return
+        target_context = context
+        if target_context is None and head_context is not None:
+            target_context = head_context
+        if target_context is None:
+            return
+        try:
+            stored_context = target_context.detach().clone()
+        except AttributeError:
+            stored_context = target_context
+        self._cfg_attn_store[layer_index] = (attn, stored_context)
+
     def _record_cached_block(self, block_index: int, hidden_states: Any) -> None:
         if not self._block_cache_active():
             return
@@ -340,6 +664,10 @@ class FeatureCache:
     # ------------------------------------------------------------------
     def on_step_start(self, timestep: Optional[int] = None) -> None:
         if not self._block_cache_active():
+            return
+        if self._cfg_share_active() and self._cfg_branch is CFGBranch.COND:
+            # Reuse the iteration established by the unconditional branch.
+            self._current_timestep = timestep
             return
         self._iteration += 1
         self._current_iteration = self._iteration

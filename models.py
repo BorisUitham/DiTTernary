@@ -11,6 +11,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 import importlib
@@ -19,7 +20,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Optional
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import PatchEmbed, Mlp
 
 
 def modulate(x, shift, scale):
@@ -104,6 +105,102 @@ class LabelEmbedder(nn.Module):
 #                                 Core DiT Model                                #
 #################################################################################
 
+class CachedAttention(nn.Module):
+    """Multi-head self-attention with optional cache-backed KV reuse."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.head_dim = head_dim
+        self.embed_dim = dim
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def _project_q(self, x):
+        b, n, _ = x.shape
+        weight = self.qkv.weight[: self.embed_dim]
+        bias = None if self.qkv.bias is None else self.qkv.bias[: self.embed_dim]
+        q = F.linear(x, weight, bias)
+        q = q.reshape(b, n, self.num_heads, self.head_dim)
+        return q.permute(0, 2, 1, 3)
+
+    def _project_kv(self, x):
+        b, n, _ = x.shape
+        weight = self.qkv.weight[self.embed_dim :]
+        bias = None if self.qkv.bias is None else self.qkv.bias[self.embed_dim :]
+        kv = F.linear(x, weight, bias)
+        kv = kv.reshape(b, n, 2, self.num_heads, self.head_dim)
+        kv = kv.permute(2, 0, 3, 1, 4)
+        return kv[0], kv[1]
+
+    def forward(self, x, feature_cache=None, layer_index=None):
+        b, n, c = x.shape
+        cfg_state = None
+        if feature_cache is not None and layer_index is not None:
+            prepare = getattr(feature_cache, "prepare_cfg_attention", None)
+            if prepare is not None:
+                cfg_state = prepare(layer_index, device=x.device, dtype=x.dtype)
+
+        use_shared_context = bool(getattr(cfg_state, "use_shared_context", lambda: False)())
+        use_shared_kv = bool(getattr(cfg_state, "use_shared_kv", lambda: False)())
+
+        if use_shared_context:
+            q = None
+            k = getattr(cfg_state, "key", None)
+            v = getattr(cfg_state, "value", None)
+        elif use_shared_kv:
+            q = self._project_q(x)
+            k = getattr(cfg_state, "key", None)
+            v = getattr(cfg_state, "value", None)
+        else:
+            q = self._project_q(x)
+            k, v = self._project_kv(x)
+
+        if feature_cache is not None and layer_index is not None:
+            try:
+                k, v = feature_cache.apply_attention(layer_index, k, v)
+            except AttributeError:
+                pass
+
+        attn = None
+        head_context = None
+        final_context = None
+        if use_shared_context and cfg_state is not None:
+            final_context = cfg_state.context
+        else:
+            if q is None:
+                q = self._project_q(x)
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            head_context = attn @ v
+            final_context = head_context.transpose(1, 2).reshape(b, n, c)
+
+        out = self.proj(final_context)
+        out = self.proj_drop(out)
+
+        if feature_cache is not None and layer_index is not None and cfg_state is not None:
+            finalize = getattr(feature_cache, "store_cfg_attention", None)
+            if finalize is not None:
+                finalize(layer_index, k, v, attn=attn, context=final_context, head_context=head_context)
+
+        return out
+
+
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -111,7 +208,7 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn = CachedAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -121,9 +218,15 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c, cache_context=None):
+    def forward(self, x, c, cache_context=None, block_index=None, feature_cache=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        attn_kwargs = {}
+        if feature_cache is not None and block_index is not None:
+            attn_kwargs = dict(feature_cache=feature_cache, layer_index=block_index)
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            **attn_kwargs,
+        )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         if cache_context is not None:
             x = cache_context.blend(x)
@@ -298,7 +401,13 @@ class DiT(nn.Module):
             cache_context = None
             if active_cache is not None:
                 x, cache_context = active_cache.on_block_input(block_idx, x)
-            x = block(x, c, cache_context=cache_context)  # (N, T, D)
+            x = block(
+                x,
+                c,
+                cache_context=cache_context,
+                block_index=block_idx,
+                feature_cache=active_cache,
+            )  # (N, T, D)
             if active_cache is not None:
                 x = active_cache.on_block_output(block_idx, x, cache_context=cache_context)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
@@ -317,22 +426,74 @@ class DiT(nn.Module):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(
-            combined,
-            t,
-            y,
-            cache_config=cache_config,
-            feature_cache=feature_cache,
-        )
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        resolved_config = cache_config or self.cache_config
+        share_value = "off"
+        if resolved_config is not None:
+            share_raw = getattr(resolved_config, "cfg_share", "off")
+            share_value = str(share_raw)
+
+        active_cache = feature_cache
+        share_requested = share_value.lower() != "off"
+        if share_requested and active_cache is None and resolved_config is not None and resolved_config.active:
+            active_cache = FeatureCache(resolved_config)
+
+        batch = x.shape[0]
+        assert batch % 2 == 0, "CFG batches must contain an even number of samples"
+        half = batch // 2
+
+        if share_requested and active_cache is not None:
+            cond_x, uncond_x = torch.split(x, half, dim=0)
+            cond_y, uncond_y = torch.split(y, half, dim=0)
+            cond_t, uncond_t = torch.split(t, half, dim=0)
+
+            cfg_start = getattr(active_cache, "on_cfg_batch_start", None)
+            if cfg_start is not None:
+                cfg_start()
+            cfg_branch = getattr(active_cache, "on_cfg_branch", None)
+            if cfg_branch is not None:
+                cfg_branch("uncond")
+
+            uncond_out = self.forward(
+                uncond_x,
+                uncond_t,
+                uncond_y,
+                cache_config=cache_config,
+                feature_cache=active_cache,
+            )
+
+            if cfg_branch is not None:
+                cfg_branch("cond")
+
+            cond_out = self.forward(
+                cond_x,
+                cond_t,
+                cond_y,
+                cache_config=cache_config,
+                feature_cache=active_cache,
+            )
+
+            cfg_end = getattr(active_cache, "on_cfg_batch_end", None)
+            if cfg_end is not None:
+                cfg_end()
+
+            cond_eps = cond_out[:, :3]
+            cond_rest = cond_out[:, 3:]
+            uncond_eps = uncond_out[:, :3]
+            uncond_rest = uncond_out[:, 3:]
+            rest = torch.cat([cond_rest, uncond_rest], dim=0)
+        else:
+            # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+            first_half = x[:half]
+            combined = torch.cat([first_half, first_half], dim=0)
+            model_out = self.forward(
+                combined,
+                t,
+                y,
+                cache_config=cache_config,
+                feature_cache=active_cache,
+            )
+            eps, rest = model_out[:, :3], model_out[:, 3:]
+            cond_eps, uncond_eps = torch.split(eps, eps.shape[0] // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
