@@ -16,6 +16,36 @@ from diffusers.models import AutoencoderKL
 from download import find_model
 from models import DiT_models
 import argparse
+import importlib
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
+
+
+def _load_cache_config():
+    try:
+        from diffusers.utils.dit_cache import CacheConfig
+        return CacheConfig
+    except ModuleNotFoundError:
+        cache_path = Path(__file__).resolve().parent / "src" / "diffusers" / "utils" / "dit_cache.py"
+        if not cache_path.exists():
+            raise
+        spec = importlib.util.spec_from_file_location("diffusers.utils.dit_cache", cache_path)
+        if spec is None or spec.loader is None:
+            raise
+        module = importlib.util.module_from_spec(spec)
+        try:
+            parent = importlib.import_module("diffusers.utils")
+        except ModuleNotFoundError:
+            parent = ModuleType("diffusers.utils")
+            sys.modules["diffusers.utils"] = parent
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module.CacheConfig
+
+
+CacheConfig = _load_cache_config()
 
 
 def main(args):
@@ -23,6 +53,12 @@ def main(args):
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    cache_config = CacheConfig.from_flags(
+        enable=args.cache_enable,
+        level=args.cache_level,
+        policy=args.cache_policy,
+    )
 
     if args.ckpt is None:
         assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
@@ -33,7 +69,8 @@ def main(args):
     latent_size = args.image_size // 8
     model = DiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        cache_config=cache_config,
     ).to(device)
     # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
@@ -79,5 +116,20 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument("--cache.enable", dest="cache_enable", type=str, default="false")
+    parser.add_argument(
+        "--cache.level",
+        dest="cache_level",
+        type=str,
+        choices=["none", "block", "attn"],
+        default="none",
+    )
+    parser.add_argument(
+        "--cache.policy",
+        dest="cache_policy",
+        type=str,
+        choices=["disabled"],
+        default="disabled",
+    )
     args = parser.parse_args()
     main(args)
