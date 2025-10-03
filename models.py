@@ -13,6 +13,12 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
+import importlib
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Optional
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
 
@@ -142,6 +148,31 @@ class FinalLayer(nn.Module):
         return x
 
 
+def _load_cache_components():
+    try:
+        from diffusers.utils.dit_cache import CacheConfig, FeatureCache
+        return CacheConfig, FeatureCache
+    except ModuleNotFoundError:
+        cache_path = Path(__file__).resolve().parent / "src" / "diffusers" / "utils" / "dit_cache.py"
+        if not cache_path.exists():
+            raise
+        spec = importlib.util.spec_from_file_location("diffusers.utils.dit_cache", cache_path)
+        if spec is None or spec.loader is None:
+            raise
+        module = importlib.util.module_from_spec(spec)
+        try:
+            parent = importlib.import_module("diffusers.utils")
+        except ModuleNotFoundError:
+            parent = ModuleType("diffusers.utils")
+            sys.modules["diffusers.utils"] = parent
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module.CacheConfig, module.FeatureCache
+
+
+CacheConfig, FeatureCache = _load_cache_components()
+
+
 class DiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
@@ -158,6 +189,7 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        cache_config: Optional[CacheConfig] = None,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -177,6 +209,7 @@ class DiT(nn.Module):
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.cache_config = cache_config
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -230,7 +263,14 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(
+        self,
+        x,
+        t,
+        y,
+        cache_config: Optional[CacheConfig] = None,
+        feature_cache: Optional[FeatureCache] = None,
+    ):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -241,20 +281,42 @@ class DiT(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
-        for block in self.blocks:
+        active_cache = feature_cache
+        resolved_config = cache_config or self.cache_config
+        if active_cache is None and resolved_config is not None and resolved_config.active:
+            active_cache = FeatureCache(resolved_config)
+        for block_idx, block in enumerate(self.blocks):
+            if active_cache is not None:
+                x = active_cache.on_block_input(block_idx, x)
             x = block(x, c)                      # (N, T, D)
+            if active_cache is not None:
+                x = active_cache.on_block_output(block_idx, x)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(
+        self,
+        x,
+        t,
+        y,
+        cfg_scale,
+        cache_config: Optional[CacheConfig] = None,
+        feature_cache: Optional[FeatureCache] = None,
+    ):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        model_out = self.forward(
+            combined,
+            t,
+            y,
+            cache_config=cache_config,
+            feature_cache=feature_cache,
+        )
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
