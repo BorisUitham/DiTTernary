@@ -1,0 +1,110 @@
+name: Benchmarks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        accelerator: [cpu, gpu]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.accelerator }}" = "gpu" ]; then
+            pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+          else
+            pip install torch torchvision
+          fi
+          pip install transformers pillow
+      - name: Run cache-off latency benchmark
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python benchmarks/latency.py \
+            --device auto \
+            --random-weights \
+            --cache.enable false \
+            --iterations 1 \
+            --warmup 1 \
+            --num-steps 2 \
+            --batch-size 2 \
+            --output latency_${{ matrix.accelerator }}_baseline.json
+      - name: Run cache-on latency benchmark
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python benchmarks/latency.py \
+            --device auto \
+            --random-weights \
+            --cache.enable true \
+            --cache.level block \
+            --cache.delta 1 \
+            --cache.alpha 0.7 \
+            --cache.cosine-threshold 0.98 \
+            --cache.warmup-steps 2 \
+            --iterations 1 \
+            --warmup 1 \
+            --num-steps 2 \
+            --batch-size 2 \
+            --output latency_${{ matrix.accelerator }}_smoothcache.json
+      - name: Compute latency delta
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+
+          base = pathlib.Path('latency_${{ matrix.accelerator }}_baseline.json')
+          smooth = pathlib.Path('latency_${{ matrix.accelerator }}_smoothcache.json')
+          if base.exists() and smooth.exists():
+              base_mean = json.loads(base.read_text())['totals']['mean_seconds']
+              smooth_mean = json.loads(smooth.read_text())['totals']['mean_seconds']
+              delta = base_mean - smooth_mean
+              print(f"Latency delta (baseline - smoothcache): {delta:.6f} s")
+          else:
+              print('Latency JSON missing; skipping delta computation')
+          PY
+      - name: Upload latency artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: latency-${{ matrix.accelerator }}
+          path: |
+            latency_${{ matrix.accelerator }}_baseline.json
+            latency_${{ matrix.accelerator }}_smoothcache.json
+      - name: Prepare images for quality metrics
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+
+          src_paths = [Path('visuals/sample_grid_0.png'), Path('visuals/sample_grid_1.png')]
+          dest = Path('benchmark_images')
+          dest.mkdir(exist_ok=True)
+          for index in range(32):
+              src = src_paths[index % len(src_paths)]
+              with Image.open(src) as handle:
+                  image = handle.convert('RGB')
+                  image.save(dest / f"{index:03d}.png")
+          PY
+      - name: Evaluate quality metrics
+        run: |
+          python benchmarks/quality.py \
+            --images benchmark_images \
+            --output quality_${{ matrix.accelerator }}.json
+      - name: Upload quality artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: quality-${{ matrix.accelerator }}
+          path: quality_${{ matrix.accelerator }}.json
